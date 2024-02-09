@@ -440,10 +440,34 @@
     // stack: addr
 %endmacro
 
+%macro build_current_general_address
+    // stack: offset
+    PUSH @SEGMENT_KERNEL_GENERAL
+    GET_CONTEXT
+    %build_address
+    // stack: addr
+%endmacro
+
+%macro build_current_general_address_no_offset
+    // stack:
+    PUSH @SEGMENT_KERNEL_GENERAL
+    GET_CONTEXT
+    %build_address_no_offset
+    // stack: addr (offset == 0)
+%endmacro
+
 %macro build_kernel_address
     // stack: seg, off
     ADD
     // stack: addr (ctx == 0)
+%endmacro
+
+%macro build_address_with_ctx(seg, off)
+    // stack: ctx
+    PUSH $seg
+    PUSH $off
+    %build_address
+    // stack: addr
 %endmacro
 
 %macro build_address_with_ctx_no_offset(seg)

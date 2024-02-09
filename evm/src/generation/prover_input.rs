@@ -1,20 +1,15 @@
-use std::cmp::min;
-use std::collections::HashMap;
-use std::mem::transmute;
+use core::mem::transmute;
+use std::collections::{BTreeSet, HashMap};
 use std::str::FromStr;
 
 use anyhow::{bail, Error};
 use ethereum_types::{BigEndianHash, H256, U256, U512};
-use itertools::{enumerate, Itertools};
+use itertools::Itertools;
 use num_bigint::BigUint;
-use plonky2::field::extension::Extendable;
 use plonky2::field::types::Field;
-use plonky2::hash::hash_types::RichField;
 use serde::{Deserialize, Serialize};
 
-use crate::cpu::kernel::aggregator::KERNEL;
 use crate::cpu::kernel::constants::context_metadata::ContextMetadata;
-use crate::cpu::kernel::constants::global_metadata::GlobalMetadata;
 use crate::extension_tower::{FieldExt, Fp12, BLS381, BN254};
 use crate::generation::prover_input::EvmField::{
     Bls381Base, Bls381Scalar, Bn254Base, Bn254Scalar, Secp256k1Base, Secp256k1Scalar,
@@ -169,10 +164,10 @@ impl<F: Field> GenerationState<F> {
     // Subsequent calls return one limb at a time, in order (first remainder and then quotient).
     fn run_bignum_modmul(&mut self) -> Result<U256, ProgramError> {
         if self.bignum_modmul_result_limbs.is_empty() {
-            let len = stack_peek(self, 1).map(u256_to_usize)??;
-            let a_start_loc = stack_peek(self, 2).map(u256_to_usize)??;
-            let b_start_loc = stack_peek(self, 3).map(u256_to_usize)??;
-            let m_start_loc = stack_peek(self, 4).map(u256_to_usize)??;
+            let len = stack_peek(self, 2).map(u256_to_usize)??;
+            let a_start_loc = stack_peek(self, 3).map(u256_to_usize)??;
+            let b_start_loc = stack_peek(self, 4).map(u256_to_usize)??;
+            let m_start_loc = stack_peek(self, 5).map(u256_to_usize)??;
 
             let (remainder, quotient) =
                 self.bignum_modmul(len, a_start_loc, b_start_loc, m_start_loc);
@@ -251,38 +246,38 @@ impl<F: Field> GenerationState<F> {
 
     /// Returns the next used jump address.
     fn run_next_jumpdest_table_address(&mut self) -> Result<U256, ProgramError> {
-        let context = self.registers.context;
-        let code_len = u256_to_usize(self.get_code_len()?.into());
+        let context = u256_to_usize(stack_peek(self, 0)? >> CONTEXT_SCALING_FACTOR)?;
 
-        if self.jumpdest_proofs.is_none() {
-            self.generate_jumpdest_proofs()?;
+        if self.jumpdest_table.is_none() {
+            self.generate_jumpdest_table()?;
         }
 
-        let Some(jumpdest_proofs) = &mut self.jumpdest_proofs else {
+        let Some(jumpdest_table) = &mut self.jumpdest_table else {
             return Err(ProgramError::ProverInputError(
                 ProverInputError::InvalidJumpdestSimulation,
             ));
         };
 
-        if let Some(ctx_jumpdest_proofs) = jumpdest_proofs.get_mut(&self.registers.context)
-            && let Some(next_jumpdest_address) = ctx_jumpdest_proofs.pop()
+        if let Some(ctx_jumpdest_table) = jumpdest_table.get_mut(&context)
+            && let Some(next_jumpdest_address) = ctx_jumpdest_table.pop()
         {
             Ok((next_jumpdest_address + 1).into())
         } else {
-            self.jumpdest_proofs = None;
+            self.jumpdest_table = None;
             Ok(U256::zero())
         }
     }
 
     /// Returns the proof for the last jump address.
     fn run_next_jumpdest_table_proof(&mut self) -> Result<U256, ProgramError> {
-        let Some(jumpdest_proofs) = &mut self.jumpdest_proofs else {
+        let context = u256_to_usize(stack_peek(self, 1)? >> CONTEXT_SCALING_FACTOR)?;
+        let Some(jumpdest_table) = &mut self.jumpdest_table else {
             return Err(ProgramError::ProverInputError(
                 ProverInputError::InvalidJumpdestSimulation,
             ));
         };
-        if let Some(ctx_jumpdest_proofs) = jumpdest_proofs.get_mut(&self.registers.context)
-            && let Some(next_jumpdest_proof) = ctx_jumpdest_proofs.pop()
+        if let Some(ctx_jumpdest_table) = jumpdest_table.get_mut(&context)
+            && let Some(next_jumpdest_proof) = ctx_jumpdest_table.pop()
         {
             Ok(next_jumpdest_proof.into())
         } else {
@@ -295,13 +290,9 @@ impl<F: Field> GenerationState<F> {
 
 impl<F: Field> GenerationState<F> {
     /// Simulate the user's code and store all the jump addresses with their respective contexts.
-    fn generate_jumpdest_proofs(&mut self) -> Result<(), ProgramError> {
+    fn generate_jumpdest_table(&mut self) -> Result<(), ProgramError> {
         let checkpoint = self.checkpoint();
         let memory = self.memory.clone();
-
-        let code = self.get_current_code()?;
-        // We need to set the simulated jumpdest bits to one as otherwise
-        // the simulation will fail.
 
         // Simulate the user's code and (unnecessarily) part of the kernel code, skipping the validate table call
         let Some(jumpdest_table) = simulate_cpu_between_labels_and_get_user_jumps(
@@ -309,7 +300,7 @@ impl<F: Field> GenerationState<F> {
             "terminate_common",
             self,
         ) else {
-            self.jumpdest_proofs = Some(HashMap::new());
+            self.jumpdest_table = Some(HashMap::new());
             return Ok(());
         };
 
@@ -318,18 +309,18 @@ impl<F: Field> GenerationState<F> {
         self.memory = memory;
 
         // Find proofs for all contexts
-        self.set_proofs_and_jumpdests(jumpdest_table);
+        self.set_jumpdest_analysis_inputs(jumpdest_table);
 
         Ok(())
     }
 
     /// Given a HashMap containing the contexts and the jumpdest addresses, compute their respective proofs,
     /// by calling `get_proofs_and_jumpdests`
-    pub(crate) fn set_proofs_and_jumpdests(
+    pub(crate) fn set_jumpdest_analysis_inputs(
         &mut self,
-        jumpdest_table: HashMap<usize, std::collections::BTreeSet<usize>>,
+        jumpdest_table: HashMap<usize, BTreeSet<usize>>,
     ) {
-        self.jumpdest_proofs = Some(HashMap::from_iter(jumpdest_table.into_iter().map(
+        self.jumpdest_table = Some(HashMap::from_iter(jumpdest_table.into_iter().map(
             |(ctx, jumpdest_table)| {
                 let code = self.get_code(ctx).unwrap();
                 if let Some(&largest_address) = jumpdest_table.last() {
@@ -342,43 +333,26 @@ impl<F: Field> GenerationState<F> {
         )));
     }
 
-    fn get_current_code(&self) -> Result<Vec<u8>, ProgramError> {
-        self.get_code(self.registers.context)
-    }
-
     fn get_code(&self, context: usize) -> Result<Vec<u8>, ProgramError> {
-        let code_len = self.get_code_len()?;
+        let code_len = self.get_code_len(context)?;
         let code = (0..code_len)
             .map(|i| {
-                u256_to_u8(self.memory.get(MemoryAddress::new(
-                    self.registers.context,
-                    Segment::Code,
-                    i,
-                )))
+                u256_to_u8(
+                    self.memory
+                        .get(MemoryAddress::new(context, Segment::Code, i)),
+                )
             })
             .collect::<Result<Vec<u8>, _>>()?;
         Ok(code)
     }
 
-    fn get_code_len(&self) -> Result<usize, ProgramError> {
+    fn get_code_len(&self, context: usize) -> Result<usize, ProgramError> {
         let code_len = u256_to_usize(self.memory.get(MemoryAddress::new(
-            self.registers.context,
+            context,
             Segment::ContextMetadata,
             ContextMetadata::CodeSize.unscale(),
         )))?;
         Ok(code_len)
-    }
-
-    fn set_jumpdest_bits(&mut self, code: &[u8]) {
-        const JUMPDEST_OPCODE: u8 = 0x5b;
-        for (pos, opcode) in CodeIterator::new(code) {
-            if opcode == JUMPDEST_OPCODE {
-                self.memory.set(
-                    MemoryAddress::new(self.registers.context, Segment::JumpdestBits, pos),
-                    U256::one(),
-                );
-            }
-        }
     }
 }
 
@@ -396,7 +370,7 @@ fn get_proofs_and_jumpdests(
     const PUSH32_OPCODE: u8 = 0x7f;
     let (proofs, _) = CodeIterator::until(code, largest_address + 1).fold(
         (vec![], 0),
-        |(mut proofs, acc), (pos, opcode)| {
+        |(mut proofs, acc), (pos, _opcode)| {
             let has_prefix = if let Some(prefix_start) = pos.checked_sub(32) {
                 code[prefix_start..pos]
                     .iter()
